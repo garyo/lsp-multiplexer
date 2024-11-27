@@ -25,6 +25,7 @@ class LSPServer:
         self.config = config
         self.writer: Optional[asyncio.StreamWriter] = None
         self.reader: Optional[asyncio.StreamReader] = None
+        self.stderr_reader: Optional[asyncio.StreamReader] = None
         self.capabilities: Dict[str, Union[Dict[str, Any], List[Any], str, bool]] = {}
         self.initialized = False
         self._process: Optional[asyncio.subprocess.Process] = None
@@ -39,6 +40,8 @@ class LSPServer:
             )
             if self._process.stdout:
                 self.reader = self._process.stdout
+            if self._process.stderr:
+                self.stderr_reader = self._process.stderr
             if self._process.stdin:
                 self.writer = self._process.stdin
 
@@ -83,7 +86,7 @@ class LSPMultiplexer:
                 raise ValueError(f"Invalid server configuration: {config}")
                 
         self.servers: List[LSPServer] = [LSPServer(config) for config in configs]
-        self.request_sources: Dict[int, Tuple[str, int]] = {}
+        self.request_sources: Dict[int, Tuple[str, Set[int]]] = {}
 
     async def start_servers(self) -> None:
         start_tasks = [server.start() for server in self.servers]
@@ -149,21 +152,79 @@ class LSPMultiplexer:
         return merged
 
     def find_server_for_request(self, method: Optional[str]) -> List[int]:
-        if not method or method in ['initialize', 'initialized', 'shutdown', 'exit']:
+        # Methods that should always go to all servers
+        all_servers_methods = {
+            # Basic protocol methods
+            'initialize',
+            'initialized',
+            'shutdown',
+            'exit',
+
+            # Document sync methods
+            'textDocument/didOpen',
+            'textDocument/didClose',
+            'textDocument/didChange',
+            'textDocument/didSave',
+
+            # Workspace methods
+            'workspace/didChangeConfiguration',
+            'workspace/didChangeWorkspaceFolders',
+            'workspace/didChangeWatchedFiles',
+        }
+
+        capability_map = {
+            # Text Document
+            'textDocument/hover': 'hoverProvider',
+            'textDocument/signatureHelp': 'signatureHelpProvider',
+            'textDocument/declaration': 'declarationProvider',
+            'textDocument/definition': 'definitionProvider',
+            'textDocument/typeDefinition': 'typeDefinitionProvider',
+            'textDocument/implementation': 'implementationProvider',
+            'textDocument/references': 'referencesProvider',
+            'textDocument/documentHighlight': 'documentHighlightProvider',
+            'textDocument/documentSymbol': 'documentSymbolProvider',
+            'textDocument/codeAction': 'codeActionProvider',
+            'textDocument/codeLens': 'codeLensProvider',
+            'textDocument/formatting': 'documentFormattingProvider',
+            'textDocument/rangeFormatting': 'documentRangeFormattingProvider',
+            'textDocument/onTypeFormatting': 'documentOnTypeFormattingProvider',
+            'textDocument/rename': 'renameProvider',
+            'textDocument/documentLink': 'documentLinkProvider',
+            'textDocument/color': 'colorProvider',
+            'textDocument/foldingRange': 'foldingRangeProvider',
+            'textDocument/selectionRange': 'selectionRangeProvider',
+            'textDocument/semanticTokens': 'semanticTokensProvider',
+            'textDocument/linkedEditingRange': 'linkedEditingRangeProvider',
+            'textDocument/moniker': 'monikerProvider',
+            'textDocument/inlayHint': 'inlayHintProvider',
+            'textDocument/inlineValue': 'inlineValueProvider',
+            'textDocument/diagnostic': 'diagnosticProvider',
+            'textDocument/completion': 'completionProvider',
+            'textDocument/publishDiagnostics': 'publishDiagnostics',
+
+            # Workspace
+            'workspace/symbol': 'workspaceSymbolProvider',
+            'workspace/executeCommand': 'executeCommandProvider',
+            'workspace/willCreateFiles': 'workspace.fileOperations.willCreate',
+            'workspace/didCreateFiles': 'workspace.fileOperations.didCreate',
+            'workspace/willRenameFiles': 'workspace.fileOperations.willRename',
+            'workspace/didRenameFiles': 'workspace.fileOperations.didRename',
+            'workspace/willDeleteFiles': 'workspace.fileOperations.willDelete',
+            'workspace/didDeleteFiles': 'workspace.fileOperations.didDelete',
+        }
+
+        if not method or method in all_servers_methods:
             return list(range(len(self.servers)))
-            
+
         supporting_servers = []
         for i, server in enumerate(self.servers):
-            if method.startswith('textDocument/'):
-                capability = f"text{method[4:]}"
+            if method in capability_map:
+                capability = capability_map[method]
                 if capability in server.capabilities:
                     supporting_servers.append(i)
-            elif method.startswith('workspace/'):
-                capability = f"workspace{method[9:]}"
-                if capability in server.capabilities:
-                    supporting_servers.append(i)
-                    
-        return supporting_servers if supporting_servers else [0]
+
+        self.logger.debug(f"find_server_for_request({method}) = {supporting_servers}")
+        return supporting_servers
 
     async def handle_client_message(self, message: dict) -> None:
         method = message.get('method')
@@ -174,7 +235,7 @@ class LSPMultiplexer:
         
         if method == 'initialize':
             if msg_id:
-                self.request_sources[msg_id] = ('initialize', len(server_indices) - 1)
+                self.request_sources[msg_id] = ('initialize', set(server_indices))
             
             for i in server_indices:
                 server = self.servers[i]
@@ -191,39 +252,49 @@ class LSPMultiplexer:
                     server.initialized = True
                     
         else:
+            if msg_id:
+                self.request_sources[msg_id] = ('request', set())
             for i in server_indices:
                 server = self.servers[i]
                 if server.writer:
                     if msg_id:
-                        self.request_sources[msg_id] = ('request', i)
+                        self.request_sources[msg_id][1].add(i)
                     self.logger.debug(f">>>SSS{i}: Writing {method or ''} message {msg_id}: {str(message)[:64]}")
                     await self.write_message(server.writer, message)
-                    if msg_id:
-                        break
 
     async def handle_server_response(self, message: dict, server_index: int, client_writer: asyncio.StreamWriter) -> None:
         msg_id = message.get('id')
         method = message.get('method', '')
         
+        self.logger.debug(f"Handling response from server {server_index}, msg {msg_id}, method {method}, expecting {self.request_sources}")
         if msg_id in self.request_sources:
-            req_type, req_server = self.request_sources[msg_id]
-            self.logger.debug(f"<<<SSS{req_server}: got expected {method} msg {msg_id}: \"{str(message)[:128]}...\"")
-            
+            req_type, req_servers = self.request_sources[msg_id]
+            self.logger.debug(f"<<<SSS{server_index}: got expected {method} msg {msg_id}: \"{str(message)[:128]}...\"")
+
             if req_type == 'initialize':
-                self.servers[server_index].capabilities = message.get('result', {}).get('capabilities', {})
-                
-                if server_index == req_server:
+                capabilities = message.get('result', {}).get('capabilities', {})
+                self.servers[server_index].capabilities = capabilities
+                self.logger.info(f"Server {server_index} capabilities:\n{json.dumps(capabilities, indent=2, sort_keys=True)}")
+
+                # If this was the last server to respond, send merged capabilities
+                req_servers.remove(server_index)
+                if not req_servers:  # empty set
                     message['result']['capabilities'] = self.merge_capabilities()
-                    self.logger.debug(f"CCC<<<: Writing {method} message {msg_id}: {str(message)[:64]}")
                     await self.write_message(client_writer, message)
                     del self.request_sources[msg_id]
                     
-            elif req_type == 'request' and req_server == server_index:
-                self.logger.debug(f"CCC<<<: Passing through {method} message {msg_id}: {str(message)[:64]}")
+            elif req_type == 'request' and server_index in set(req_servers):
+                self.logger.debug(f"CCC<<<: Passing {method} reply {msg_id}: {str(message)[:64]}")
                 await self.write_message(client_writer, message)
-                del self.request_sources[msg_id]
+                req_servers.remove(server_index)
+                if not req_servers:
+                    del self.request_sources[msg_id]
             else:
-                self.logger.error(f"SERVER: DROPPING {req_type} message {msg_id} from {req_server} to client: {str(message)[:64]}")
+                self.logger.error(f"SERVER: DROPPING {req_type} message {msg_id} from {server_index} to client: {str(message)[:64]}")
+                if server_index in req_servers:
+                    req_servers.remove(server_index)
+                if not req_servers:
+                    del self.request_sources[msg_id]
                 
         else:
             self.logger.debug(f"CCC<<<SSS{server_index}: passing {method} message {msg_id or ''}: {str(message)[:64]}")
@@ -243,16 +314,40 @@ class LSPMultiplexer:
             
         try:
             while True:
-                message = await self.read_message(server.reader)
-                if message is None:
-                    self.logger.error("Server {server_index} has died.")
-                    break
-                if not message:
-                    break
-                await self.handle_server_response(message, server_index, client_writer)
-        except Exception as e:
-            self.logger.error(f"Server {server_index} connection error: {str(e)}")
+                # Create tasks for both streams
+                message_task = asyncio.create_task(self.read_message(server.reader))
+                tasks = [message_task]
+                if server.stderr_reader:
+                    stderr_task = asyncio.create_task(server.stderr_reader.readline())
+                    tasks = [message_task, stderr_task]
+                
+                # Wait for either task to complete
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
 
+                # Cancel the pending task
+                for task in pending:
+                    task.cancel()
+
+                # Handle whichever task completed
+                for task in done:
+                    try:
+                        result = await task
+                        if task == message_task:
+                            if result is None:
+                                self.logger.error(f"Server {server_index} has died.")
+                                return
+                            if not result:
+                                return
+                            await self.handle_server_response(result, server_index, client_writer)
+                        else:  # stderr_task
+                            assert(isinstance(result, bytes))
+                            stderr_line = result.decode('utf-8').rstrip()
+                            if stderr_line:
+                                self.logger.error(f"stderr {server_index}: {stderr_line}")
+                    except Exception as e:
+                        self.logger.error(f"Error handling server {server_index} I/O: {e}\n{traceback.format_exc()}")
+        except Exception as e:
+            self.logger.error(f"Server {server_index} connection error: {str(e)}\n{traceback.format_exc()}")
 
     async def handle_client_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -319,17 +414,29 @@ async def main() -> None:
                         help='Set the logging level (default: INFO)')
     args = parser.parse_args()
 
+    # Logging setup
+    SUPPORTS_COLOR = hasattr(sys.stderr, 'isatty') and sys.stderr.isatty()
+    RED = '\033[91m' if SUPPORTS_COLOR else ''
+    RESET = '\033[0m' if SUPPORTS_COLOR else ''
+    class ColorFormatter(logging.Formatter):
+        def format(self, record):
+            if record.levelno == logging.ERROR:
+                record.msg = f"{RED}{record.msg}{RESET}"
+            return super().format(record)
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(ColorFormatter('%(asctime)s - %(levelname)s - %(message)s'))
+
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
         format='%(asctime)s - %(levelname)s - %(message)s',
-        stream=sys.stderr
+        handlers=[handler]
     )
 
 
     multiplexer = LSPMultiplexer([
+        ["uv", "run", "/Users/garyo/src/test-langserver/test-server.py"],
         ["pyright-langserver", "--stdio"],
         #"tcp://localhost:8080",
-        #["ruff-lsp"]
     ])
     
     try:
