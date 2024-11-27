@@ -8,12 +8,6 @@ from urllib.parse import urlparse
 import traceback
 import logging
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    stream=sys.stderr
-)
-
 @dataclass
 class ServerConfig:
     """Configuration for an LSP server"""
@@ -319,7 +313,18 @@ async def main() -> None:
     parser.add_argument('--stdio', action='store_true', help='Use stdio instead of TCP')
     parser.add_argument('--host', default='127.0.0.1', help='Host to listen on (default: 127.0.0.1)')
     parser.add_argument('--port', type=int, default=8888, help='Port to listen on (default: 8888)')
+    parser.add_argument('--log-level', 
+                        default='INFO',
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                        help='Set the logging level (default: INFO)')
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper()),
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        stream=sys.stderr
+    )
+
 
     multiplexer = LSPMultiplexer([
         ["pyright-langserver", "--stdio"],
