@@ -3,7 +3,7 @@ import json
 import sys
 import argparse
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union, Any
+from typing import Dict, List, Optional, Tuple, Union, Any, Set
 from urllib.parse import urlparse
 import traceback
 import logging
@@ -74,6 +74,8 @@ class LSPServer:
                 pass
 
 class LSPMultiplexer:
+    RESPONSE_TIMEOUT = 1.5  # seconds
+
     def __init__(self, server_configs: List[Union[List[str], str]]) -> None:
         self.logger = logging.getLogger(__name__)
         configs: List[ServerConfig] = []
@@ -86,7 +88,8 @@ class LSPMultiplexer:
                 raise ValueError(f"Invalid server configuration: {config}")
                 
         self.servers: List[LSPServer] = [LSPServer(config) for config in configs]
-        self.request_sources: Dict[int, Tuple[str, Set[int]]] = {}
+        self.request_sources: Dict[int, Tuple[str, str, Set[int]]] = {} # msg_id -> ("request" or "initialize", method, set(server_indices))
+        self.pending_responses: Dict[int, Dict[int, dict]] = {}  # msg_id -> {server_index -> response}
 
     async def start_servers(self) -> None:
         start_tasks = [server.start() for server in self.servers]
@@ -227,7 +230,7 @@ class LSPMultiplexer:
         return supporting_servers
 
     async def handle_client_message(self, message: dict) -> None:
-        method = message.get('method')
+        method = message.get('method', 'UNKNOWN')
         msg_id = message.get('id')
         self.logger.debug(f"CCC>>>: got message {msg_id}, {method}: {str(message)[:128]}")
         
@@ -235,7 +238,7 @@ class LSPMultiplexer:
         
         if method == 'initialize':
             if msg_id:
-                self.request_sources[msg_id] = ('initialize', set(server_indices))
+                self.request_sources[msg_id] = ('initialize', method, set(server_indices))
             
             for i in server_indices:
                 server = self.servers[i]
@@ -253,14 +256,65 @@ class LSPMultiplexer:
                     
         else:
             if msg_id:
-                self.request_sources[msg_id] = ('request', set())
+                self.request_sources[msg_id] = ('request', method, set())
             for i in server_indices:
                 server = self.servers[i]
                 if server.writer:
                     if msg_id:
-                        self.request_sources[msg_id][1].add(i)
+                        self.request_sources[msg_id][2].add(i)
                     self.logger.debug(f">>>SSS{i}: Writing {method or ''} message {msg_id}: {str(message)[:64]}")
                     await self.write_message(server.writer, message)
+
+    def merge_completion_responses(self, responses: List[dict]) -> dict:
+        """Merge multiple completion responses into one."""
+        # Take the first response as base to preserve jsonrpc, id, etc.
+        merged = responses[0].copy()
+        all_items = []
+
+        for response in responses:
+            result = response.get('result', {})
+            if not result:
+                continue
+
+            if isinstance(result, dict):
+                # Response is CompletionList
+                items = result.get('items', [])
+            else:
+                # Response is CompletionItem[]
+                items = result
+
+            all_items.extend(items)
+
+        # Return as CompletionList
+        merged['result'] = {
+            'isIncomplete': any(r.get('result', {}).get('isIncomplete', False)
+                              for r in responses if isinstance(r.get('result', {}), dict)),
+            'items': all_items
+        }
+        self.logger.debug(f"Merged completion responses: {merged}")
+        return merged
+
+    async def handle_response_timeout(self, msg_id: int, client_writer: asyncio.StreamWriter) -> None:
+        """Wait for timeout, then send whatever responses we have."""
+        self.logger.warning(f"Starting timeout for msg_id {msg_id}...")
+        await asyncio.sleep(self.RESPONSE_TIMEOUT)
+        self.logger.warning(f"Timer expired for msg_id {msg_id}: {self.pending_responses}")
+        if msg_id in self.pending_responses:
+            req_type, method, req_servers = self.request_sources[msg_id]
+            self.logger.warning(f"Timeout waiting for responses to {msg_id} ({method}) from servers {req_servers}")
+
+            responses = list(self.pending_responses[msg_id].values())
+            if responses:  # If we got at least one response
+                if method == 'textDocument/completion':
+                    merged_response = self.merge_completion_responses(responses)
+                    self.logger.debug(f"CCC<<<: sending merged {method} response {msg_id}: {str(merged_response)[:64]}")
+                    await self.write_message(client_writer, merged_response)
+                else:
+                    self.logger.debug(f"CCC<<<: sending first {method} response {msg_id}: {str(responses[0])[:64]}")
+                    await self.write_message(client_writer, responses[0])
+            # Clean up
+            del self.pending_responses[msg_id]
+            del self.request_sources[msg_id]
 
     async def handle_server_response(self, message: dict, server_index: int, client_writer: asyncio.StreamWriter) -> None:
         msg_id = message.get('id')
@@ -268,7 +322,7 @@ class LSPMultiplexer:
         
         self.logger.debug(f"Handling response from server {server_index}, msg {msg_id}, method {method}, expecting {self.request_sources}")
         if msg_id in self.request_sources:
-            req_type, req_servers = self.request_sources[msg_id]
+            req_type, method, req_servers = self.request_sources[msg_id]
             self.logger.debug(f"<<<SSS{server_index}: got expected {method} msg {msg_id}: \"{str(message)[:128]}...\"")
 
             if req_type == 'initialize':
@@ -282,13 +336,29 @@ class LSPMultiplexer:
                     message['result']['capabilities'] = self.merge_capabilities()
                     await self.write_message(client_writer, message)
                     del self.request_sources[msg_id]
-                    
             elif req_type == 'request' and server_index in set(req_servers):
-                self.logger.debug(f"CCC<<<: Passing {method} reply {msg_id}: {str(message)[:64]}")
-                await self.write_message(client_writer, message)
+                # Store this response
+                if msg_id not in self.pending_responses:
+                    self.pending_responses[msg_id] = {}
+                self.pending_responses[msg_id][server_index] = message
+                # Handle the case where one or more servers never replies
+                asyncio.create_task(self.handle_response_timeout(msg_id, client_writer))
+
                 req_servers.remove(server_index)
+
+                # If this was the last response we were waiting for
                 if not req_servers:
+                    responses = list(self.pending_responses[msg_id].values())
+                    if method == 'textDocument/completion':
+                        merged_response = self.merge_completion_responses(responses)
+                        self.logger.debug(f"CCC<<<: sending merged {method} reply {msg_id}: {str(message)[:64]}")
+                        await self.write_message(client_writer, merged_response)
+                    else:
+                        # For now, just send the first response for other methods
+                        self.logger.debug(f"CCC<<<: sending first {method} reply {msg_id}: {str(message)[:64]}")
+                        await self.write_message(client_writer, responses[0])
                     del self.request_sources[msg_id]
+                    del self.pending_responses[msg_id]
             else:
                 self.logger.error(f"SERVER: DROPPING {req_type} message {msg_id} from {server_index} to client: {str(message)[:64]}")
                 if server_index in req_servers:
