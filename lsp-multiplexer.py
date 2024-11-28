@@ -126,6 +126,9 @@ class LSPMultiplexer:
             return None
 
     async def write_message(self, writer: asyncio.StreamWriter, message: dict) -> None:
+        if writer.is_closing():
+            self.logger.error(f"Error writing message: writer closed.")
+            return
         try:
             content = json.dumps(message).encode('utf-8')
             header = self.create_header(len(content)).encode('utf-8')
@@ -226,6 +229,8 @@ class LSPMultiplexer:
                 if capability in server.capabilities:
                     supporting_servers.append(i)
 
+        if not supporting_servers:
+            supporting_servers = list(range(len(self.servers))) # all of them???
         self.logger.debug(f"find_server_for_request({method}) = {supporting_servers}")
         return supporting_servers
 
@@ -291,7 +296,6 @@ class LSPMultiplexer:
                               for r in responses if isinstance(r.get('result', {}), dict)),
             'items': all_items
         }
-        self.logger.debug(f"Merged completion responses: {merged}")
         return merged
 
     async def handle_response_timeout(self, msg_id: int, client_writer: asyncio.StreamWriter) -> None:
