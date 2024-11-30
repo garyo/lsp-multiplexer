@@ -2,11 +2,13 @@ import asyncio
 import json
 import sys
 import argparse
+import tomli
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union, Any, Set
 from urllib.parse import urlparse
 import traceback
 import logging
+import os
 
 @dataclass
 class ServerConfig:
@@ -19,6 +21,47 @@ class ServerConfig:
             raise ValueError("Either command or url must be specified")
         if self.command and self.url:
             raise ValueError("Only one of command or url should be specified")
+            
+    @classmethod
+    def from_config(cls, config: Union[List[str], str, dict]) -> 'ServerConfig':
+        """Create a ServerConfig from various config formats"""
+        if isinstance(config, list):
+            return cls(command=config)
+        elif isinstance(config, str):
+            return cls(url=config)
+        elif isinstance(config, dict):
+            if 'command' in config:
+                return cls(command=config['command'])
+            elif 'url' in config:
+                return cls(url=config['url'])
+        raise ValueError(f"Invalid server configuration: {config}")
+
+def load_config(config_file: str) -> List[ServerConfig]:
+    """Load server configurations from a TOML file"""
+    try:
+        with open(config_file, 'rb') as f:
+            config = tomli.load(f)
+        
+        servers_config = config.get('servers', [])
+        if not servers_config:
+            raise ValueError("No servers defined in config file")
+            
+        return [ServerConfig.from_config(server) for server in servers_config]
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Config file not found: {config_file}")
+    except tomli.TOMLDecodeError as e:
+        raise ValueError(f"Invalid TOML in config file: {e}")
+
+def get_default_config_paths() -> List[str]:
+    """Get list of default config file paths to check"""
+    return [
+        # Current directory
+        "lsp-multiplexer.toml",
+        # User's config directory
+        os.path.expanduser("~/.config/lsp-multiplexer/config.toml"),
+        # System-wide config
+        "/etc/lsp-multiplexer/config.toml"
+    ]
 
 class LSPServer:
     def __init__(self, config: ServerConfig) -> None:
@@ -483,9 +526,11 @@ async def main() -> None:
     parser.add_argument('--host', default='127.0.0.1', help='Host to listen on (default: 127.0.0.1)')
     parser.add_argument('--port', type=int, default=8888, help='Port to listen on (default: 8888)')
     parser.add_argument('--log-level', 
-                        default='INFO',
-                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
-                        help='Set the logging level (default: INFO)')
+                       default='INFO',
+                       choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                       help='Set the logging level (default: INFO)')
+    parser.add_argument('--config',
+                       help='Path to config file (default: search in standard locations)')
     args = parser.parse_args()
 
     # Logging setup
@@ -506,12 +551,32 @@ async def main() -> None:
         handlers=[handler]
     )
 
+    logger = logging.getLogger(__name__)
 
-    multiplexer = LSPMultiplexer([
-        ["uv", "run", "/Users/garyo/src/test-langserver/test-server.py"],
-        ["pyright-langserver", "--stdio"],
-        #"tcp://localhost:8080",
-    ])
+    # Load server configurations
+    server_configs = None
+    config_paths = [args.config] if args.config else get_default_config_paths()
+    
+    for config_path in config_paths:
+        try:
+            if config_path and os.path.exists(config_path):
+                server_configs = load_config(config_path)
+                logger.info(f"Loaded configuration from {config_path}")
+                break
+        except Exception as e:
+            logger.error(f"Error loading config from {config_path}: {e}")
+            if args.config:  # Only raise if user explicitly specified config file
+                raise
+
+    # Fall back to default configuration if no config file found
+    if not server_configs:
+        logger.info("No config file found, using default configuration")
+        server_configs = [
+            ServerConfig(command=["pyright-langserver", "--stdio"]),
+            # Add other default servers here
+        ]
+
+    multiplexer = LSPMultiplexer(server_configs)
     
     try:
         if args.stdio:
