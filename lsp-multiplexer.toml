@@ -1,0 +1,9 @@
+[[servers]]
+command = ["pyright-langserver", "--stdio"]
+
+[[servers]]
+command = ["uv", "run", "/path/to/test-server.py"]
+
+# Optional: TCP Server
+# [[servers]]
+# url = "tcp://localhost:8080"
