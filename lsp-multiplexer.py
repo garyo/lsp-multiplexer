@@ -119,7 +119,7 @@ class LSPServer:
 class LSPMultiplexer:
     RESPONSE_TIMEOUT = 1.5  # seconds
 
-    def __init__(self, server_configs: List[Union[List[str], str]]) -> None:
+    def __init__(self, server_configs: List[ServerConfig]) -> None:
         self.logger = logging.getLogger(__name__)
         configs: List[ServerConfig] = []
         for config in server_configs:
