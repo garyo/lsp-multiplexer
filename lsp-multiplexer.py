@@ -2,13 +2,16 @@ import asyncio
 import json
 import sys
 import argparse
-import tomli
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union, Any, Set
 from urllib.parse import urlparse
 import traceback
 import logging
 import os
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 @dataclass
 class ServerConfig:
@@ -40,8 +43,8 @@ def load_config(config_file: str) -> List[ServerConfig]:
     """Load server configurations from a TOML file"""
     try:
         with open(config_file, 'rb') as f:
-            config = tomli.load(f)
         
+            config = tomllib.load(f)
         servers_config = config.get('servers', [])
         if not servers_config:
             raise ValueError("No servers defined in config file")
@@ -49,7 +52,7 @@ def load_config(config_file: str) -> List[ServerConfig]:
         return [ServerConfig.from_config(server) for server in servers_config]
     except FileNotFoundError:
         raise FileNotFoundError(f"Config file not found: {config_file}")
-    except tomli.TOMLDecodeError as e:
+    except tomllib.TOMLDecodeError as e:
         raise ValueError(f"Invalid TOML in config file: {e}")
 
 def get_default_config_paths() -> List[str]:
