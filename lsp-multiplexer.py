@@ -121,16 +121,7 @@ class LSPMultiplexer:
 
     def __init__(self, server_configs: List[ServerConfig]) -> None:
         self.logger = logging.getLogger(__name__)
-        configs: List[ServerConfig] = []
-        for config in server_configs:
-            if isinstance(config, list):
-                configs.append(ServerConfig(command=config))
-            elif isinstance(config, str):
-                configs.append(ServerConfig(url=config))
-            else:
-                raise ValueError(f"Invalid server configuration: {config}")
-
-        self.servers: List[LSPServer] = [LSPServer(config) for config in configs]
+        self.servers: List[LSPServer] = [LSPServer(config) for config in server_configs]
         self.request_sources: Dict[int, Tuple[str, str, Set[int]]] = {} # msg_id -> ("request" or "initialize", method, set(server_indices))
         self.pending_responses: Dict[int, Dict[int, dict]] = {}  # msg_id -> {server_index -> response}
 
