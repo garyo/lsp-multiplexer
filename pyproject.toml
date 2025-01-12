@@ -5,3 +5,6 @@ description = "Simple LSP server multiplexer"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = ["tomli; python_version < \"3.11\""]
+
+[project.scripts]
+lsp-multiplexer = "lsp_multiplexer:main"
