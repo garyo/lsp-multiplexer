@@ -15,13 +15,13 @@ class ServerConfig:
     """Configuration for an LSP server"""
     command: Optional[List[str]] = None
     url: Optional[str] = None
-    
+
     def __post_init__(self) -> None:
         if not self.command and not self.url:
             raise ValueError("Either command or url must be specified")
         if self.command and self.url:
             raise ValueError("Only one of command or url should be specified")
-            
+
     @classmethod
     def from_config(cls, config: Union[List[str], str, dict]) -> 'ServerConfig':
         """Create a ServerConfig from various config formats"""
@@ -41,11 +41,11 @@ def load_config(config_file: str) -> List[ServerConfig]:
     try:
         with open(config_file, 'rb') as f:
             config = tomli.load(f)
-        
+
         servers_config = config.get('servers', [])
         if not servers_config:
             raise ValueError("No servers defined in config file")
-            
+
         return [ServerConfig.from_config(server) for server in servers_config]
     except FileNotFoundError:
         raise FileNotFoundError(f"Config file not found: {config_file}")
@@ -121,16 +121,7 @@ class LSPMultiplexer:
 
     def __init__(self, server_configs: List[ServerConfig]) -> None:
         self.logger = logging.getLogger(__name__)
-        configs: List[ServerConfig] = []
-        for config in server_configs:
-            if isinstance(config, list):
-                configs.append(ServerConfig(command=config))
-            elif isinstance(config, str):
-                configs.append(ServerConfig(url=config))
-            else:
-                raise ValueError(f"Invalid server configuration: {config}")
-                
-        self.servers: List[LSPServer] = [LSPServer(config) for config in configs]
+        self.servers: List[LSPServer] = [LSPServer(config) for config in server_configs]
         self.request_sources: Dict[int, Tuple[str, str, Set[int]]] = {} # msg_id -> ("request" or "initialize", method, set(server_indices))
         self.pending_responses: Dict[int, Dict[int, dict]] = {}  # msg_id -> {server_index -> response}
 
@@ -162,7 +153,7 @@ class LSPMultiplexer:
             content = await stream.read(content_length)
             if not content:
                 return None
-            
+
             return json.loads(content.decode('utf-8'))
         except Exception as e:
             self.logger.error(f"Error reading message: {e}")
@@ -281,19 +272,19 @@ class LSPMultiplexer:
         method = message.get('method', 'UNKNOWN')
         msg_id = message.get('id')
         self.logger.debug(f"CCC>>>: got message {msg_id}, {method}: {str(message)[:128]}")
-        
+
         server_indices = self.find_server_for_request(method)
-        
+
         if method == 'initialize':
             if msg_id:
                 self.request_sources[msg_id] = ('initialize', method, set(server_indices))
-            
+
             for i in server_indices:
                 server = self.servers[i]
                 if server.writer:
                     self.logger.debug(f">>>SSS{i}: Writing initialize message {msg_id}: {str(message)[:64]}")
                     await self.write_message(server.writer, message)
-                    
+
         elif method == 'initialized':
             for i in server_indices:
                 server = self.servers[i]
@@ -301,7 +292,7 @@ class LSPMultiplexer:
                     self.logger.debug(f">>>SSS{i}: Writing initialized message {msg_id}: {str(message)[:64]}")
                     await self.write_message(server.writer, message)
                     server.initialized = True
-                    
+
         else:
             if msg_id:
                 self.request_sources[msg_id] = ('request', method, set())
@@ -366,7 +357,7 @@ class LSPMultiplexer:
     async def handle_server_response(self, message: dict, server_index: int, client_writer: asyncio.StreamWriter) -> None:
         msg_id = message.get('id')
         method = message.get('method', '')
-        
+
         self.logger.debug(f"Handling response from server {server_index}, msg {msg_id}, method {method}, expecting {self.request_sources}")
         if msg_id in self.request_sources:
             req_type, method, req_servers = self.request_sources[msg_id]
@@ -412,7 +403,7 @@ class LSPMultiplexer:
                     req_servers.remove(server_index)
                 if not req_servers:
                     del self.request_sources[msg_id]
-                
+
         else:
             self.logger.debug(f"CCC<<<SSS{server_index}: passing {method} message {msg_id or ''}: {str(message)[:64]}")
             await self.write_message(client_writer, message)
@@ -428,7 +419,7 @@ class LSPMultiplexer:
         server = self.servers[server_index]
         if not server.reader:
             return
-            
+
         try:
             while True:
                 # Create tasks for both streams
@@ -437,7 +428,7 @@ class LSPMultiplexer:
                 if server.stderr_reader:
                     stderr_task = asyncio.create_task(server.stderr_reader.readline())
                     tasks = [message_task, stderr_task]
-                
+
                 # Wait for either task to complete
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
 
@@ -473,12 +464,12 @@ class LSPMultiplexer:
                 asyncio.create_task(self.handle_server_stream(i, writer))
                 for i in range(len(self.servers))
             ]
-            
+
             await client_task
-            
+
             for task in server_tasks:
                 task.cancel()
-                
+
         except Exception as e:
             self.logger.error(f"Error in client connection: {e}")
         finally:
@@ -507,11 +498,11 @@ class LSPMultiplexer:
 
     async def serve_tcp(self, host: str = '127.0.0.1', port: int = 8888) -> None:
         await self.start_servers()
-        
+
         server = await asyncio.start_server(
             self.handle_client_connection, host, port
         )
-        
+
         self.logger.info(f"LSP Multiplexer listening on {host}:{port}")
         async with server:
             await server.serve_forever()
@@ -525,7 +516,7 @@ async def main() -> None:
     parser.add_argument('--stdio', action='store_true', help='Use stdio instead of TCP')
     parser.add_argument('--host', default='127.0.0.1', help='Host to listen on (default: 127.0.0.1)')
     parser.add_argument('--port', type=int, default=8888, help='Port to listen on (default: 8888)')
-    parser.add_argument('--log-level', 
+    parser.add_argument('--log-level',
                        default='INFO',
                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                        help='Set the logging level (default: INFO)')
@@ -556,7 +547,7 @@ async def main() -> None:
     # Load server configurations
     server_configs = None
     config_paths = [args.config] if args.config else get_default_config_paths()
-    
+
     for config_path in config_paths:
         try:
             if config_path and os.path.exists(config_path):
@@ -577,7 +568,7 @@ async def main() -> None:
         ]
 
     multiplexer = LSPMultiplexer(server_configs)
-    
+
     try:
         if args.stdio:
             await multiplexer.serve_stdio()
